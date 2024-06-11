@@ -1,34 +1,24 @@
 import os
-import torch
-import torch.distributed
-from torch.distributed import destroy_process_group
-import torch.multiprocessing as mp
-import argparse
-from datetime import timedelta
-import math
-import os
 import time
-import sys
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, get_scheduler, MistralForCausalLM
-from dolomite_engine.hf_models.models import GPTDolomiteForCausalLM
-from torch.distributed import (
-    ReduceOp,
-    all_reduce,
-)
-import yaml
 from dataclasses import dataclass
+from datetime import timedelta
 
 import deepspeed
-from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
+import torch
+import torch.distributed
+import torch.multiprocessing as mp
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from dolomite_engine.hf_models.models import GPTDolomiteForCausalLM
+from torch.distributed import ReduceOp, all_reduce, destroy_process_group
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, get_scheduler
+
 from multipack_sampler import find_packing_max_batch_len_and_grad_accum
 from token_dataset import setup_dataloader, setup_dataset
 from tokenizer_utils import setup_tokenizer
 from utils import (
-    save_hf_format_ds,
-    set_random_seed,
-    setup_logger,
     convert_loss_to_reduce_sum,
+    save_hf_format_ds,
 )
 
 # NOTE: JAMES KUNSTLE add to fix -- RuntimeError: cutlassF: no kernel found to launch!
@@ -256,10 +246,10 @@ class DeepSpeedTrainer:
         model = convert_loss_to_reduce_sum(model)
 
         if self.args.is_granite:
+            from dolomite_engine.enums import GradientCheckpointingMethod
             from dolomite_engine.gradient_checkpointing import (
                 apply_gradient_checkpointing,
             )
-            from dolomite_engine.enums import GradientCheckpointingMethod
 
             block_name = model._no_split_modules[0]
             apply_gradient_checkpointing(
@@ -271,7 +261,8 @@ class DeepSpeedTrainer:
         elif self.args.lora_r > 0:
             # if lora
             from peft import LoraConfig
-            from utils import prepare_peft_model, patch_target_module
+
+            from utils import patch_target_module, prepare_peft_model
 
             if self.args.lora_target_modules is None:
                 self.args.__dict__["target_modules"] = [
@@ -292,8 +283,9 @@ class DeepSpeedTrainer:
             prepare_peft_model(model, peft_config)
 
             # patch DS to work with quantized models
-            from deepspeed import DeepSpeedEngine
             from functools import partial
+
+            from deepspeed import DeepSpeedEngine
 
             if self.args.lora_quant_bits is not None:
                 patch_target_module(
@@ -343,7 +335,7 @@ class DeepSpeedTrainer:
 
         elapsed_time = time.time() - start_time
         overall_throughput = (
-            self.train_micro_batch_size_per_gpu * world_size / elapsed_time
+            self.train_micro_batch_size_per_gpu * self.world_size / elapsed_time
         )
         current_lr = self.model.lr_scheduler.get_last_lr()[0]
         cuda_mem_allocated = torch.cuda.memory_allocated() / (1024**3)
@@ -418,7 +410,7 @@ class DeepSpeedTrainer:
             if (
                 self.global_step * self.train_micro_batch_size_per_gpu
             ) % self.samples_per_save == 0:
-                self._save_checkpoint()
+                self._save_checkpoint(epoch=epoch)
 
             self.global_step += 1
             if self.local_rank == 0:
@@ -443,11 +435,9 @@ class DeepSpeedTrainer:
         self.model.train()
 
         self.global_step = 1
-        (
+
+        if self.local_rank == 0:
             print(f"\033[93mNumber of samples per save: {self.samples_per_save}\033[0m")
-            if self.local_rank == 0
-            else None
-        )
 
         for epoch in range(self.num_epochs):
             torch.distributed.barrier()
