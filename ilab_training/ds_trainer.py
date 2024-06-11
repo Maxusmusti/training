@@ -11,6 +11,7 @@ import time
 import sys
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, get_scheduler, MistralForCausalLM
+from dolomite_engine.hf_models.models import GPTDolomiteForCausalLM
 from torch.distributed import (
     ReduceOp,
     all_reduce,
@@ -62,6 +63,7 @@ class TrainerArgs:
     max_batch_len: int
     n_warmup_steps: int
     samples_per_save: int
+    seed: int = None
 
 
 class DeepSpeedTrainer:
@@ -98,8 +100,8 @@ class DeepSpeedTrainer:
         self.model_name_or_path: str = args.model_name_or_path
         self.data_path: str = args.data_path
         self.world_size = (
-            world_size
-            if world_size
+            args.world_size
+            if args.world_size > 0
             else torch.distributed.get_world_size()  # TODO: get this from appropriate config.
         )
         self.local_rank = int(
@@ -168,7 +170,7 @@ class DeepSpeedTrainer:
             is_granite=False,
             max_batch_len=self.max_batch_len,
             packing_max_batch_len=self.packing_max_batch_len,
-            seed=self.seed,
+            seed=self.args.seed,
         )
 
     def _wrap_model_with_deepspeed(self):
@@ -213,24 +215,93 @@ class DeepSpeedTrainer:
 
         Returns:
             nn.Module: model
-        """
 
+        """
         # TODO: need to look at model config to early-out if not a supported model
         # rather than download model and check later.
 
-        model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=self.model_name_or_path,
-            # attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
-        )
+        if self.args.is_granite:
+            model = GPTDolomiteForCausalLM.from_pretrained(
+                self.model_name_or_path,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.bfloat16,
+                use_padding_free_transformer=True,
+            )
+        else:
+            bnb_config = None
+            if self.args.lora_r > 0 and self.args.lora_quant_bits == 4:
+                from transformers import BitsAndBytesConfig
+
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.float16,  # if not set will throw a warning about slow speeds when training
+                )
+            model = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=self.model_name_or_path,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.bfloat16,
+                quantization_config=bnb_config,
+            )
+
         assert model.__class__.__name__ in [
-            "MistralForCausalLM",  # NOTE: only support Mistral right now.
-            # "GPTMegatronForCausalLM",
-            # "LlamaForCausalLM"
+            "MistralForCausalLM",
+            "GPTDolomiteForCausalLM",
+            "LlamaForCausalLM",
+            "Starcoder2ForCausalLM",
+            "GemmaForCausalLM",
         ], f"Model class name: {model.__class__.__name__} is not supported."
 
         model = convert_loss_to_reduce_sum(model)
-        model.gradient_checkpointing_enable()
+
+        if self.args.is_granite:
+            from dolomite_engine.gradient_checkpointing import (
+                apply_gradient_checkpointing,
+            )
+            from dolomite_engine.enums import GradientCheckpointingMethod
+
+            block_name = model._no_split_modules[0]
+            apply_gradient_checkpointing(
+                model,
+                GradientCheckpointingMethod.block,
+                block_name=block_name,
+                use_reentrant=True,  # this should be the HF default mode
+            )
+        elif self.args.lora_r > 0:
+            # if lora
+            from peft import LoraConfig
+            from utils import prepare_peft_model, patch_target_module
+
+            if self.args.lora_target_modules is None:
+                self.args.__dict__["target_modules"] = [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                ]
+
+            peft_config = LoraConfig(
+                lora_alpha=self.args.lora_alpha,
+                lora_dropout=self.args.lora_dropout,
+                r=self.args.lora_r,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=self.args.target_modules,
+            )
+            prepare_peft_model(model, peft_config)
+
+            # patch DS to work with quantized models
+            from deepspeed import DeepSpeedEngine
+            from functools import partial
+
+            if self.args.lora_quant_bits is not None:
+                patch_target_module(
+                    "deepspeed.DeepSpeedEngine",
+                    partial(DeepSpeedEngine, dont_change_device=True),
+                )
+        else:
+            model.gradient_checkpointing_enable()
         return model
 
     def _configure_deepspeed(self):
@@ -292,7 +363,7 @@ class DeepSpeedTrainer:
     def _run_batch(self, batch, epoch):
         start_time = time.time()
         aggregated_values = torch.zeros(3, dtype=torch.float32).to(self.local_rank)
-        aggregated_values[0] = batch["num_loss_counted_tokens"]
+        aggregated_values[0] = batch.pop("num_loss_counted_tokens")
         aggregated_values[1] = len(batch["input_ids"])
 
         # NOTE: commented this out for the time being until we support granite.
