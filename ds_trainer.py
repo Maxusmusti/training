@@ -2,6 +2,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum
 
 import deepspeed
 import torch
@@ -46,64 +47,49 @@ class TrainerArgs:
 
     model_name_or_path: str
     data_path: str
-    output_path: str
+    ckpt_path: str
+    is_granite: bool = True
+
+    num_gpus: int
+    max_seq_len: int
+    num_epochs: int
+    effective_batch_size: int
+    save_samples: int
     learning_rate: float
-    n_epochs: int
-    train_batch_size: int
-    max_batch_len: int
-    n_warmup_steps: int
-    samples_per_save: int
+    warmup_steps: int
+
+    ds_offload_strat: Enum["cpu", "nvme", None]
+    cpu_offload_optimizer: bool
+    cpu_offload_params: dict
+    sharding_strat: Enum["HYBRID", "FULL"]
+
+    quantize_dtype: Enum["nf4", "fp8", None]
+    lora: bool
+    lora_rank: int
+    lora_alpha: float
+    lora_dropout: float
+    target_modules: list
+
     seed: int = None
+    world_size: int
 
 
-class DeepSpeedTrainer:
+class DataWrangler:
+    """Collates dataset preparation steps
+    into a single class, calculating required
+    training parameters that the trainer can use.
+
+    Name is temporary.
+    """
+
     def __init__(self, args: TrainerArgs) -> None:
-        """
-        Order of initialization:
-        1. Download and/or load tokenizer for model.
-        2. Initialize DataSet.
-        3. Calculate MultiPack-optimization values for batches.
-        4. Setup DataLoader (with MultipackDistributedBatchSampler)
-        5. Download and/or load model with loss layer optimizations (reduce_sum).
-        6. Initialize optimizer.
-        7. Configure DeepSpeed distributed training settings.
-        8. Wrap model with DeepSpeed initialization class.
-
-
-        Design considerations:
-        1. Convinced that data loading + processing should NOT be in this class.
-            Should be in its own class. However, for the time being, tightly coupling
-            as a linear pipeline is convenient.
-        2. Generally prefer functional-programming-style instantiation methods. i.e.
-            if a method (e.g. _setup_tokenizer) has a side-effect (setting self.tokenizer)
-            it should return a tokenizer rather than setting self.tokenizer internally.
-            This style is preferred for readability.
-            HOWEVER passing args to instantiation methods can be relaxed for the sake of
-            brevity.
-        3. All of the instance values (self.data_path, e.g.) are also in the self.args object.
-            Choosing to copy the value into an instance-member is based on brevity.
-        4.
-        """
-
-        # From TrainerArgs ------------------------------------------
-        self.args: TrainerArgs = args
-        self.model_name_or_path: str = args.model_name_or_path
+        self.args = args
+        self.model_name_or_path = args.model_name_or_path
         self.data_path: str = args.data_path
-        self.world_size = (
-            args.world_size
-            if args.world_size > 0
-            else torch.distributed.get_world_size()  # TODO: get this from appropriate config.
-        )
-        self.local_rank = int(
-            os.environ["LOCAL_RANK"]
-        )  # TODO: get this from appropriate config.
-        self.learning_rate: float = args.learning_rate
-        self.num_warmup_steps: int = args.n_warmup_steps
-        self.num_epochs: int = args.n_epochs
         self.max_batch_len: int = args.max_batch_len
-        self.train_batch_size: int = args.train_batch_size
+        self.train_batch_size: int = args.effective_batch_size
         self.samples_per_save = (
-            args.samples_per_save // self.train_batch_size
+            args.save_samples // self.train_batch_size
         ) * self.train_batch_size
 
         # Data loading and utils -------------------------------------
@@ -114,19 +100,6 @@ class DeepSpeedTrainer:
         )
         self.train_micro_batch_size_per_gpu: int = self._calc_micro_batch_per_gpu()
         self.data_loader = self._setup_data_loader()
-
-        # Model, Optimizer, DS configuration -------------------------
-        self.model = (
-            self._prep_model()
-        )  # model needs a little setup before deepspeed-ifying
-        self.optimizer = self._setup_optimizer()
-        self.df_config = self._configure_deepspeed()
-        self.model = (
-            self._wrap_model_with_deepspeed()
-        )  # okay now, wrap model w/ deepspeed.
-
-        # Training status -----------------------------------
-        self.global_step: int = 1
 
     def _calc_micro_batch_per_gpu(self):
         return (
@@ -149,6 +122,9 @@ class DeepSpeedTrainer:
         return setup_tokenizer(model_name_or_path=self.model_name_or_path)
 
     def _setup_dataset(self):
+
+        # NOTE: mock is False by default for the moment, if we need
+        # it we can parameterize it.
         return setup_dataset(data_path=self.data_path, mock=False)
 
     def _setup_data_loader(self):
@@ -162,6 +138,62 @@ class DeepSpeedTrainer:
             packing_max_batch_len=self.packing_max_batch_len,
             seed=self.args.seed,
         )
+
+
+class DeepSpeedTrainer:
+    def __init__(self, args: TrainerArgs, data_wrangler: DataWrangler) -> None:
+        """
+        Order of initialization:
+        1. Download and/or load tokenizer for model.
+        2. Initialize DataSet.
+        3. Calculate MultiPack-optimization values for batches.
+        4. Setup DataLoader (with MultipackDistributedBatchSampler)
+        5. Download and/or load model with loss layer optimizations (reduce_sum).
+        6. Initialize optimizer.
+        7. Configure DeepSpeed distributed training settings.
+        8. Wrap model with DeepSpeed initialization class.
+
+
+        Design considerations:
+        1. Generally prefer functional-programming-style instantiation methods. i.e.
+            if a method (e.g. _setup_tokenizer) has a side-effect (setting self.tokenizer)
+            it should return a tokenizer rather than setting self.tokenizer internally.
+            This style is preferred for readability.
+            HOWEVER passing args to instantiation methods can be relaxed for the sake of
+            brevity.
+        2. All of the instance values (self.data_path, e.g.) are also in the self.args object.
+            Choosing to copy the value into an instance-member is based on brevity.
+        """
+
+        # From TrainerArgs ------------------------------------------
+        self.args: TrainerArgs = args
+        self.model_name_or_path: str = args.model_name_or_path
+        self.world_size = (
+            args.world_size
+            if args.world_size > 0
+            else torch.distributed.get_world_size()  # TODO: get this from appropriate config.
+        )
+        self.local_rank = int(
+            os.environ["LOCAL_RANK"]
+        )  # TODO: get this from appropriate config.
+        self.learning_rate: float = args.learning_rate
+        self.num_warmup_steps: int = args.warmup_steps
+        self.num_epochs: int = args.num_epochs
+
+        # Model, Optimizer, DS configuration -------------------------
+        self.model = (
+            self._prep_model()
+        )  # model needs a little setup before deepspeed-ifying
+        self.optimizer = self._setup_optimizer()
+        self.df_config = self._configure_deepspeed()
+        self.model = (
+            self._wrap_model_with_deepspeed()
+        )  # okay now, wrap model w/ deepspeed.
+
+        # Training status -----------------------------------
+        self.global_step: int = 1
+        self.data_loader = data_wrangler.data_loader
+        self.data_wrangler = data_wrangler
 
     def _wrap_model_with_deepspeed(self):
         """Wraps model object with deepspeed initializer and sets learning
@@ -219,12 +251,14 @@ class DeepSpeedTrainer:
             )
         else:
             bnb_config = None
-            if self.args.lora_r > 0 and self.args.lora_quant_bits == 4:
+
+            # NOTE: James, updated from original because of config design doc.
+            if self.args.lora_rank > 0 and self.args.quantize_dtype == "nf4":
                 from transformers import BitsAndBytesConfig
 
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_quant_type="nf4",  # TODO: parameterize for different data types.
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=torch.float16,  # if not set will throw a warning about slow speeds when training
                 )
@@ -275,7 +309,7 @@ class DeepSpeedTrainer:
             peft_config = LoraConfig(
                 lora_alpha=self.args.lora_alpha,
                 lora_dropout=self.args.lora_dropout,
-                r=self.args.lora_r,
+                r=self.args.lora_rank,
                 bias="none",
                 task_type="CAUSAL_LM",
                 target_modules=self.args.target_modules,
@@ -310,8 +344,8 @@ class DeepSpeedTrainer:
             # "train_batch_size": self.train_micro_batch_size_per_gpu
             # * self.world_size
             # * self.grad_accum_steps,
-            "gradient_accumulation_steps": self.grad_accum_steps,
-            "train_micro_batch_size_per_gpu": self.train_micro_batch_size_per_gpu,
+            "gradient_accumulation_steps": self.data_loader.grad_accum_steps,
+            "train_micro_batch_size_per_gpu": self.data_loader.train_micro_batch_size_per_gpu,
             "steps_per_print": 1,
             "zero_optimization": {
                 "stage": 2,
@@ -335,7 +369,9 @@ class DeepSpeedTrainer:
 
         elapsed_time = time.time() - start_time
         overall_throughput = (
-            self.train_micro_batch_size_per_gpu * self.world_size / elapsed_time
+            self.data_loader.train_micro_batch_size_per_gpu
+            * self.world_size
+            / elapsed_time
         )
         current_lr = self.model.lr_scheduler.get_last_lr()[0]
         cuda_mem_allocated = torch.cuda.memory_allocated() / (1024**3)
@@ -377,13 +413,13 @@ class DeepSpeedTrainer:
         num_loss_counted_tokens = aggregated_values[0]
         # dividing by the total number of non-padding tokens and multiplying by the number
         # of GPUs so when deepspeed averages by world_size, it will be the correct loss.
-        loss = loss / num_loss_counted_tokens * world_size
+        loss = loss / num_loss_counted_tokens * self.args.world_size
 
         self.model.backward(loss)
         self.model.step()
 
         print(
-            f"\033[93mPer-token loss scaled by world size: {(loss/num_loss_counted_tokens) * world_size}\033[0m"
+            f"\033[93mPer-token loss scaled by world size: {(loss/num_loss_counted_tokens) * self.args.world_size}\033[0m"
         )
         print(
             f"Epoch: {epoch}, Step: {self.global_step}, Rank: {torch.distributed.get_rank()}, Loss = {loss}"
@@ -402,14 +438,14 @@ class DeepSpeedTrainer:
         if self.local_rank == 0:
             prog_bar = tqdm(range(len(self.data_loader)), desc=f"Epoch {epoch}")
 
-        for batch in self.data_loader:
+        for batch in self.data_loader.data_loader:
 
             # run a single forward and backward pass.
             self._run_batch(batch, epoch)
 
             if (
-                self.global_step * self.train_micro_batch_size_per_gpu
-            ) % self.samples_per_save == 0:
+                self.global_step * self.data_wrangler.train_micro_batch_size_per_gpu
+            ) % self.data_wrangler.samples_per_save == 0:
                 self._save_checkpoint(epoch=epoch)
 
             self.global_step += 1
@@ -437,149 +473,43 @@ class DeepSpeedTrainer:
         self.global_step = 1
 
         if self.local_rank == 0:
-            print(f"\033[93mNumber of samples per save: {self.samples_per_save}\033[0m")
+            print(
+                f"\033[93mNumber of samples per save: {self.data_wrangler.samples_per_save}\033[0m"
+            )
 
         for epoch in range(self.num_epochs):
             torch.distributed.barrier()
             self._run_epoch(epoch)
 
 
-# class TrainHarness:
-
-#     def __init__(self, n_parallel: int, trainer: Trainer):
-#         self.n_parallel = n_parallel
-#         self.world_size: int = 5
-
-#     def _iter(self, local_rank: int, world_size: int):
-#         """
-#         Will be called within the context of its object but in
-#         parallel with other invokations.
-#         """
-#         print(f"LOCAL_RANK: {local_rank}, WORLD_SIZE: {world_size}")
-
-#         # each object should be its own instance.
-#         trainer = trainer()
-#         trainer.train(local_rank, world_size, epochs=10)
-
-#     def train(self):
-#         mp.spawn(self._iter, args=(self.world_size,), nprocs=self.n_parallel)
-
-
-def main(rank: int, world_size):
+def main():
     # ======================================================
-    # TODO: these are fake, move to proper config.
+    # NOTE: these are fake.
     train_args = TrainerArgs(
         model_name_or_path="./model",
         data_path="/dev/shm/train.jsonl",
-        output_dir="./out",
+        ckpt_path="./out",
         num_epochs=5,
-        train_batch_size=32,
+        effective_batch_size=32,
         learning_rate=1e-6,
         num_warmup_steps=385,
-        local_rank=rank,
-        world_size=world_size,
-        seed=42,
+        world_size=os.environ["WORLD_SIZE"],
         sharding_strat="HYBRID_SHARD",
-        max_batch_len=200,
     )
     # ======================================================
 
     distributed_setup()
-    trainer = DeepSpeedTrainer(args=train_args)
+    dataw = DataWrangler(train_args)
+    trainer = DeepSpeedTrainer(args=train_args, data_wrangler=dataw)
     trainer.train()
     torch.distributed.barrier()
     destroy_process_group()
 
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--model_name_or_path", type=str)
-    # parser.add_argument("--data_path", type=str)
 
-    # # where we'll store checkpoints.
-    # parser.add_argument("--output_dir", type=str)
-    # parser.add_argument("--num_epochs", type=int, default=1)
+    # make sure this stuff is set.
+    assert os.environ["WORLD_SIZE"] > 0
+    assert os.environ["RANK"] >= 0
 
-    # # (DeepSpeed doc definitions)
-    # # the amount of data samples that leads to one step of model update.
-    # # train_batch_size = train_micro_batch_size_per_gpu * grad_accum_steps * num_gpus
-    # parser.add_argument("--train_batch_size", type=int, default=3840)
-    # parser.add_argument("--learning_rate", type=float, default=1e-4)
-
-    # # Number of very-low-learning-rate steps that the model training flow takes.
-    # # Hypothetically, helps the attention mechanism slowly acclimate to the data.
-    # # Practically, helps the adaptive optimizer (Adam) compute good statistics on
-    # # the gradients it's seeing.
-    # parser.add_argument("--num_warmup_steps", type=int, default=1000)
-
-    # # number of data points to be seen before the trainer saves a checkpoint
-    # # of the model and training parameters.
-    # parser.add_argument("--save_samples", type=int)
-    # parser.add_argument("--log_level", type=str, default="INFO")
-    # parser.add_argument("--seed", type=int, default=42)
-
-    # # removing this for the time being.
-    # # parser.add_argument("--mock_data", action="store_true")
-    # # parser.add_argument("--mock_len", type=int, default=2600)
-    # parser.add_argument(
-    #     "--sharding_strategy",
-    #     type=str,
-    #     default="FULL_SHARD",
-    #     help="Sharding strategy to be used for distributed training.",
-    # )
-    # parser.add_argument("--max_batch_len", type=int, default=60000)
-    # args = parser.parse_args()
-
-    world_size = torch.cuda.device_count()
-    mp.spawn(main, args=(world_size), nprocs=world_size)
-
-"""
-What we're using to run working scripts.
-
-torchrun \
---nnodes=1 \
---nproc_per_node=gpu \
---node_rank=0 \
---standalone \
-main_ds.py \
---model_name_or_path="/ilab-data/model" \
---data_path="/dev/shm/data.jsonl" \
---output_dir="out" \
---num_epochs=5 \
---train_batch_size=32 \
---learning_rate="1e-6" \
---num_warmup_steps=800 \
---save_samples=12000 \
---log_level="INFO" \
---seed=42 \
-
-------------------------------------------------------------------
-
-The parser that the existing script uses.
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--model_name_or_path", type=str)
-parser.add_argument("--data_path", type=str)
-parser.add_argument("--output_dir", type=str)
-parser.add_argument("--num_epochs", type=int, default=1)
-# parser.add_argument("--train_micro_batch_size_per_gpu", type=int, default=8)
-parser.add_argument("--train_batch_size", type=int, default=3840)
-parser.add_argument("--learning_rate", type=float, default=1e-4)
-parser.add_argument("--num_warmup_steps", type=int, default=1000)
-# parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-parser.add_argument("--save_samples", type=int)
-parser.add_argument("--log_level", type=str, default="INFO")
-parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--mock_data", action="store_true")
-parser.add_argument("--mock_len", type=int, default=2600)
-parser.add_argument(
-    "--sharding_strategy",
-    type=str,
-    # choices=[e.name for e in ShardingStrategy],
-    default="FULL_SHARD",
-    help="Sharding strategy to be used for distributed training.",
-)
-parser.add_argument("--is_granite", action="store_true")
-parser.add_argument("--max_batch_len", type=int, default=60000)
-args = parser.parse_args()
-"""
+    main()
