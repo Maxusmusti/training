@@ -2,7 +2,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
-from enum import Enum
+from pprint import pprint
 
 import deepspeed
 import torch
@@ -21,6 +21,8 @@ from utils import (
     convert_loss_to_reduce_sum,
     save_hf_format_ds,
 )
+
+#something
 
 # NOTE: JAMES KUNSTLE add to fix -- RuntimeError: cutlassF: no kernel found to launch!
 torch.backends.cuda.enable_mem_efficient_sdp(False)
@@ -48,30 +50,27 @@ class TrainerArgs:
     model_name_or_path: str
     data_path: str
     ckpt_path: str
-    is_granite: bool = True
-
     num_gpus: int
     max_seq_len: int
+    max_batch_len: int
     num_epochs: int
     effective_batch_size: int
     save_samples: int
     learning_rate: float
     warmup_steps: int
-
-    ds_offload_strat: Enum["cpu", "nvme", None]
+    ds_offload_strat: str # Enum["cpu", "nvme", None]
     cpu_offload_optimizer: bool
     cpu_offload_params: dict
-    sharding_strat: Enum["HYBRID", "FULL"]
-
-    quantize_dtype: Enum["nf4", "fp8", None]
+    sharding_strat: str # Enum["HYBRID", "FULL"]
+    quantize_dtype: str # Enum["nf4", "fp8", None]
     lora: bool
     lora_rank: int
     lora_alpha: float
     lora_dropout: float
     target_modules: list
-
-    seed: int = None
     world_size: int
+    is_granite: bool = True
+    seed: int = 42 
 
 
 class DataWrangler:
@@ -86,7 +85,6 @@ class DataWrangler:
         self.args = args
         self.model_name_or_path = args.model_name_or_path
         self.data_path: str = args.data_path
-        self.max_batch_len: int = args.max_batch_len
         self.train_batch_size: int = args.effective_batch_size
         self.samples_per_save = (
             args.save_samples // self.train_batch_size
@@ -95,6 +93,7 @@ class DataWrangler:
         # Data loading and utils -------------------------------------
         self.tokenizer = self._setup_tokenizer()
         self.dataset = self._setup_dataset()
+        self.max_batch_len = args.max_batch_len
         self.packing_max_batch_len, self.grad_accum_steps = (
             self._calc_packing_grad_accum()
         )
@@ -114,7 +113,7 @@ class DataWrangler:
         return find_packing_max_batch_len_and_grad_accum(
             num_gpus=torch.distributed.get_world_size(),
             avg_sample_len=self.dataset.get_lengths().mean(),
-            train_batch_size=self.train_batch_size,
+            effective_batch_size=self.train_batch_size,
             max_batch_len_per_gpu=self.max_batch_len,
         )
 
@@ -134,7 +133,7 @@ class DataWrangler:
             pad_token_id=self.tokenizer.pad_token_id,
             num_workers=8,
             is_granite=False,
-            max_batch_len=self.max_batch_len,
+            max_batch_len=self.packing_max_batch_len,
             packing_max_batch_len=self.packing_max_batch_len,
             seed=self.args.seed,
         )
@@ -168,6 +167,8 @@ class DeepSpeedTrainer:
         # From TrainerArgs ------------------------------------------
         self.args: TrainerArgs = args
         self.model_name_or_path: str = args.model_name_or_path
+        self.data_loader = data_wrangler.data_loader
+        self.data_wrangler = data_wrangler
         self.world_size = (
             args.world_size
             if args.world_size > 0
@@ -179,6 +180,7 @@ class DeepSpeedTrainer:
         self.learning_rate: float = args.learning_rate
         self.num_warmup_steps: int = args.warmup_steps
         self.num_epochs: int = args.num_epochs
+        self.samples_per_gpu = args.effective_batch_size // self.data_wrangler.grad_accum_steps // self.world_size 
 
         # Model, Optimizer, DS configuration -------------------------
         self.model = (
@@ -192,8 +194,6 @@ class DeepSpeedTrainer:
 
         # Training status -----------------------------------
         self.global_step: int = 1
-        self.data_loader = data_wrangler.data_loader
-        self.data_wrangler = data_wrangler
 
     def _wrap_model_with_deepspeed(self):
         """Wraps model object with deepspeed initializer and sets learning
@@ -344,8 +344,9 @@ class DeepSpeedTrainer:
             # "train_batch_size": self.train_micro_batch_size_per_gpu
             # * self.world_size
             # * self.grad_accum_steps,
-            "gradient_accumulation_steps": self.data_loader.grad_accum_steps,
-            "train_micro_batch_size_per_gpu": self.data_loader.train_micro_batch_size_per_gpu,
+            "train_batch_size": self.samples_per_gpu * self.world_size * self.data_wrangler.grad_accum_steps,
+            "gradient_accumulation_steps": self.data_wrangler.grad_accum_steps,
+            "train_micro_batch_size_per_gpu": self.samples_per_gpu, 
             "steps_per_print": 1,
             "zero_optimization": {
                 "stage": 2,
@@ -369,7 +370,7 @@ class DeepSpeedTrainer:
 
         elapsed_time = time.time() - start_time
         overall_throughput = (
-            self.data_loader.train_micro_batch_size_per_gpu
+            self.data_wrangler.train_micro_batch_size_per_gpu
             * self.world_size
             / elapsed_time
         )
@@ -438,7 +439,7 @@ class DeepSpeedTrainer:
         if self.local_rank == 0:
             prog_bar = tqdm(range(len(self.data_loader)), desc=f"Epoch {epoch}")
 
-        for batch in self.data_loader.data_loader:
+        for batch in self.data_loader:
 
             # run a single forward and backward pass.
             self._run_batch(batch, epoch)
@@ -484,17 +485,31 @@ class DeepSpeedTrainer:
 
 def main():
     # ======================================================
-    # NOTE: these are fake.
+    # TODO: validate real params
     train_args = TrainerArgs(
-        model_name_or_path="./model",
-        data_path="/dev/shm/train.jsonl",
-        ckpt_path="./out",
+        model_name_or_path="/home/jkunstle/model",
+        data_path="/home/jkunstle/data/data.jsonl",
+        ckpt_path="/home/jkunstle/out",
         num_epochs=5,
-        effective_batch_size=32,
+        effective_batch_size=64,
         learning_rate=1e-6,
-        num_warmup_steps=385,
-        world_size=os.environ["WORLD_SIZE"],
-        sharding_strat="HYBRID_SHARD",
+        warmup_steps=385,
+        world_size=int(os.getenv("WORLD_SIZE", 1)),
+        ds_offload_strat=None,
+        num_gpus=int(os.getenv("WORLD_SIZE", 1)),
+        max_seq_len=4000,
+        max_batch_len=70000,
+        save_samples=25000,
+        cpu_offload_optimizer=False,
+        cpu_offload_params=None,
+        sharding_strat=None,
+        quantize_dtype=None,
+        lora=False,
+        lora_rank=10,
+        lora_dropout=0.1,
+        lora_alpha=0.9,
+        target_modules=None,
+        is_granite=True
     )
     # ======================================================
 
@@ -509,7 +524,7 @@ def main():
 if __name__ == "__main__":
 
     # make sure this stuff is set.
-    assert os.environ["WORLD_SIZE"] > 0
-    assert os.environ["RANK"] >= 0
+    assert int(os.environ["WORLD_SIZE"]) > 0
+    assert int(os.environ["RANK"]) >= 0
 
     main()
