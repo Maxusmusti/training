@@ -395,14 +395,10 @@ class DeepSpeedTrainer:
         aggregated_values[0] = batch.pop("num_loss_counted_tokens")
         aggregated_values[1] = len(batch["input_ids"])
 
-        # NOTE: commented this out for the time being until we support granite.
-        # if not args.is_granite:
-        #     for k in batch:
-        #         batch[k] = batch[k].to(local_rank)
-
         # move data over to GPU
-        for k in batch:
-            batch[k] = batch[k].to(self.local_rank)
+        if not self.args.is_granite:
+            for k in batch:
+                batch[k] = batch[k].to(self.local_rank)
 
         output = self.model(**batch, use_cache=False)
         loss = output.loss
