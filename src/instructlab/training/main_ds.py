@@ -193,6 +193,19 @@ def setup_model(args, tokenizer, train_loader, grad_accum, flash_enabled):
         "GraniteForCausalLM",
     ], f"Model class name: {model.__class__.__name__} is not supported."
 
+
+    to_optimize = []
+    for name, param in model.named_parameters():
+        # If the parameter is not in the pre-trained checkpoint (uninitialized)
+        if "scale" in name:
+            if param.requires_grad:  # Only initialize trainable parameters
+                # Initialize to 1
+                torch.nn.init.constant_(param, 1)
+                to_optimize.append(param)
+                print(f"Initialized {name} to 1")
+        else:
+            param.requires_grad = False
+
     model = convert_loss_to_reduce_sum(model, use_dolomite=args.use_dolomite)
     model = add_noisy_embeddings(model, noise_alpha=args.NEFTune_alpha)
 
@@ -228,18 +241,6 @@ def setup_model(args, tokenizer, train_loader, grad_accum, flash_enabled):
                 output.requires_grad_(True)
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-    to_optimize = []
-    for name, param in model.named_parameters():
-        # If the parameter is not in the pre-trained checkpoint (uninitialized)
-        if "scale" in name:
-            if param.requires_grad:  # Only initialize trainable parameters
-                # Initialize to 1
-                torch.nn.init.constant_(param, 1)
-                to_optimize.append(param)
-                print(f"Initialized {name} to 1")
-        else:
-            param.requires_grad = False
 
     accelerator = setup_accelerator(args, model, grad_accum)
     if args.distributed_training_framework == DistributedBackend.FSDP.value:
