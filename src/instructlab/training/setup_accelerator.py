@@ -85,7 +85,7 @@ def get_fsdp_config(args, model: PreTrainedModel):
         sharding_strategy=ShardingStrategy[args.fsdp_sharding_strategy],
         cpu_offload=CPUOffload(args.cpu_offload_params_fsdp),
     )
-
+    use_orig_params = True
     # `use_orig_params` must be disabled when using LoRA and FSDP together
     # Source: https://huggingface.co/docs/peft/en/accelerate/fsdp#the-important-parts
     if args.lora_r > 0:
