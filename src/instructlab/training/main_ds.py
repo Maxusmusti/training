@@ -82,10 +82,10 @@ from instructlab.training.utils import (
 import instructlab.training.data_process as dp
 
 
-def setup_optimizer(args, model):
+def setup_optimizer(args, model, to_optimize):
     if args.distributed_training_framework == DistributedBackend.FSDP.value:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            to_optimize,
             lr=args.learning_rate,
             betas=(0.9, 0.95),
             weight_decay=0.0,
@@ -229,10 +229,22 @@ def setup_model(args, tokenizer, train_loader, grad_accum, flash_enabled):
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
+    to_optimize = []
+    for name, param in model.named_parameters():
+        # If the parameter is not in the pre-trained checkpoint (uninitialized)
+        if "scale" in name:
+            if param.requires_grad:  # Only initialize trainable parameters
+                # Initialize to 1
+                torch.nn.init.constant_(param, 1)
+                to_optimize.append(param)
+                print(f"Initialized {name} to 1")
+        else:
+            param.requires_grad = False
+
     accelerator = setup_accelerator(args, model, grad_accum)
     if args.distributed_training_framework == DistributedBackend.FSDP.value:
         model = accelerator.prepare(model)
-    optimizer = setup_optimizer(args, model)
+    optimizer = setup_optimizer(args, model, to_optimize)
 
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler,
